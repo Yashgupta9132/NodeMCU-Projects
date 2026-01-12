@@ -1,0 +1,206 @@
+/*
+ESP32 Air Quality Monitor
+ZPH02 + MQ135 + DHT22 + SD + WiFi NTP Time
+Pins: SD(5,18,19,23), ZPH02(16TX,17RX), MQ135(32A,27D), DHT22(14)
+*/
+
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <DHTesp.h>
+#include <HardwareSerial.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+
+
+const char* ssid     = "ADD_YOUR_WIFI";
+const char* password = "ADD_YOUR_WIFI_PASSWORD";
+
+// Time (example: UTC +5:30 → change if needed)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;
+const int   daylightOffset_sec = 0;
+
+// ===================== PIN DEFINITIONS =====================
+#define SD_CS    5
+#define DHT_PIN  14
+#define MQ_AQ    32
+#define MQ_DQ    27
+#define ZPH_RX   17
+#define ZPH_TX   16
+
+// ===================== GLOBALS =====================
+DHTesp dht;
+HardwareSerial zphSerial(2);
+File dataFile;
+
+unsigned long lastLog = 0;
+float pm25_sum = 0;
+uint16_t pm_count = 0;
+
+// ===================== TIME FUNCTION =====================
+String getDateTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "1970-01-01 00:00:00";
+  }
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+// ===================== AQI CALCULATION =====================
+float calcEPA_PM25_AQI(float pm) {
+  if (pm <= 12.0) return (pm / 12.0) * 50;
+  if (pm <= 35.4) return 50 + ((pm - 12.0) / 23.4) * 50;
+  if (pm <= 55.4) return 100 + ((pm - 35.4) / 20.0) * 50;
+  if (pm <= 150.4) return 150 + ((pm - 55.4) / 95.0) * 50;
+  if (pm <= 250.4) return 200 + ((pm - 150.4) / 100.0) * 100;
+  if (pm <= 350.4) return 300 + ((pm - 250.4) / 100.0) * 100;
+  if (pm <= 500.4) return 400 + ((pm - 350.4) / 150.0) * 100;
+  return 500;
+}
+
+String getAQIcategory(float aqi) {
+  if (aqi <= 50) return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Unhealthy(Sensitive)";
+  if (aqi <= 200) return "Unhealthy";
+  if (aqi <= 300) return "Very Unhealthy";
+  return "Hazardous";
+}
+
+// ===================== ZPH02 PARSER =====================
+float parseZPH02_PM25() {
+  while (zphSerial.available() >= 9) {
+    if (zphSerial.read() != 0xFF) continue;
+
+    uint8_t buf[9];
+    buf[0] = 0xFF;
+    zphSerial.readBytes(&buf[1], 8);
+
+    uint8_t sum = 0;
+    for (int i = 1; i <= 7; i++) sum += buf[i];
+    sum = (~sum) + 1;
+
+    if (buf[8] == sum) {
+      uint16_t raw = (buf[3] << 8) | buf[4];
+      return raw / 100.0f;   // μg/m³
+    }
+  }
+  return -1.0;
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n=== ESP32 AQI MONITOR (AI READY) ===");
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  // Time sync
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Time synchronized");
+
+  // SD Card
+  SPI.begin(18, 19, 23, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card Mount Failed");
+    while (1);
+  }
+
+  // CSV header
+  if (!SD.exists("/aqi_data.csv")) {
+    dataFile = SD.open("/aqi_data.csv", FILE_WRITE);
+    dataFile.println("DateTime,Temp_C,Humidity_%,MQ_Analog,MQ_Digital,PM25_ugm3,eCO2,AQI,Category");
+    dataFile.close();
+  }
+
+  // Sensors
+  dht.setup(DHT_PIN, DHTesp::DHT22);
+  pinMode(MQ_DQ, INPUT);
+  zphSerial.begin(9600, SERIAL_8N1, ZPH_RX, ZPH_TX);
+
+  Serial.println("Sensors initialized");
+  Serial.println("MQ135 warm-up: 24–48 hours recommended");
+  Serial.println("Logging every 30 seconds\n");
+}
+
+// ===================== LOOP =====================
+void loop() {
+
+  // Continuous PM sampling
+  float pm = parseZPH02_PM25();
+  if (pm > 0) {
+    pm25_sum += pm;
+    pm_count++;
+  }
+
+  // Log every 30 seconds
+  if (millis() - lastLog >= 30000) {
+    readAndLogSensors();
+    lastLog = millis();
+  }
+
+  delay(100);
+}
+
+// ===================== READ & LOG =====================
+void readAndLogSensors() {
+
+  TempAndHumidity dh = dht.getTempAndHumidity();
+  float temp = dh.temperature;
+  float hum  = dh.humidity;
+
+  int mq_analog  = analogRead(MQ_AQ);
+  int mq_digital = digitalRead(MQ_DQ);
+
+  // eCO2 (relative)
+  float eCO2_ppm = ((mq_analog / 4095.0) * 1000.0) + 400;
+
+  // PM2.5 averaging
+  float avg_pm25 = (pm_count > 0) ? (pm25_sum / pm_count) : 0.0;
+  pm25_sum = 0;
+  pm_count = 0;
+
+  float aqi = calcEPA_PM25_AQI(avg_pm25);
+  String category = getAQIcategory(aqi);
+  String dateTime = getDateTimeString();
+
+  // Serial output
+  Serial.println("--- 30s SENSOR READING ---");
+  Serial.println(dateTime);
+  Serial.printf("Temp: %.1f°C |  Humidity: %.1f%%\n", temp, hum);
+  Serial.printf("PM2.5: %.1f μg/m³ | AQI: %.0f (%s)\n", avg_pm25, aqi, category.c_str());
+  Serial.printf("MQ135: A%d D%d | eCO2: ~%.0f ppm\n\n",
+                mq_analog, mq_digital, eCO2_ppm);
+
+  // SD logging
+  dataFile = SD.open("/aqi_data.csv", FILE_APPEND);
+  if (dataFile) {
+    dataFile.printf("%s,%.1f,%.1f,%d,%d,%.1f,%.0f,%.0f,\"%s\"\n",
+                    dateTime.c_str(),
+                    temp, hum,
+                    mq_analog, mq_digital,
+                    avg_pm25,
+                    eCO2_ppm,
+                    aqi,
+                    category.c_str());
+    dataFile.close();
+    Serial.println("Logged to SD\n");
+  } else {
+    Serial.println("SD write failed\n");
+  }
+}
+
+
