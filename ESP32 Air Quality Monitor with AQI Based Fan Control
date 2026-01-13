@@ -1,0 +1,365 @@
+/************************************************************
+ * ESP32 AIR QUALITY MONITOR – PIN CONNECTIONS & WIRING
+ *
+ * Board: ESP32 Dev Module / DevKit V1
+ *
+ * =========================================================
+ * 1) DHT22 – Temperature & Humidity Sensor
+ * =========================================================
+ * DHT22 Pin     →  ESP32 Pin
+ * --------------------------------
+ * VCC           →  3.3V
+ * DATA          →  GPIO 14   (DHT_PIN)
+ * GND           →  GND
+ *
+ * Note:
+ * - Use 10kΩ pull-up resistor between DATA and 3.3V
+ *
+ * =========================================================
+ * 2) MQ135 – Air Quality / Gas Sensor
+ * =========================================================
+ * MQ135 Pin     →  ESP32 Pin
+ * --------------------------------
+ * VCC           →  5V (VIN)
+ * GND           →  GND
+ * AO (Analog)   →  GPIO 32   (MQ_AQ)
+ * DO (Digital)  →  GPIO 27   (MQ_DQ)
+ *
+ * Notes:
+ * - Sensor needs 24–48 hours warm-up
+ * - Ensure AO output ≤ 3.3V (most modules OK)
+ *
+ * =========================================================
+ * 3) ZPH02 – PM2.5 Sensor (UART)
+ * =========================================================
+ * ZPH02 Pin     →  ESP32 Pin
+ * --------------------------------
+ * VCC           →  5V or 3.3V (check module)
+ * GND           →  GND
+ * TX            →  GPIO 17   (ZPH_RX)
+ * RX            →  GPIO 16   (ZPH_TX)
+ *
+ * Notes:
+ * - TX → RX, RX → TX (cross connection)
+ * - Uses HardwareSerial(2)
+ *
+ * =========================================================
+ * 4) SD Card Module – SPI Interface
+ * =========================================================
+ * SD Module Pin →  ESP32 Pin
+ * --------------------------------
+ * CS            →  GPIO 5    (SD_CS)
+ * MOSI          →  GPIO 23
+ * MISO          →  GPIO 19
+ * SCK           →  GPIO 18
+ * VCC           →  3.3V ONLY (⚠️ Never 5V)
+ * GND           →  GND
+ *
+ * =========================================================
+ * 5) Intel 4-Pin PWM Fan
+ * =========================================================
+ * Fan Wire      →  ESP32 / Supply
+ * --------------------------------
+ * Black (GND)   →  GND
+ * Yellow (+12V) →  External 12V Power
+ * Green (TACH)  →  GPIO 26   (FAN_TACH_PIN)
+ * Blue (PWM)    →  GPIO 25   (FAN_PWM_PIN)
+ *
+ * Notes:
+ * - Fan requires external 12V supply
+ * - Connect 12V GND to ESP32 GND
+ * - PWM: 25kHz, active LOW (Intel spec)
+ * - Transistor recommended for PWM pin
+ *
+ * =========================================================
+ * 6) POWER & GROUND
+ * =========================================================
+ * - ESP32 3.3V → DHT22, SD Card
+ * - ESP32 5V   → MQ135, ZPH02
+ * - External   → Fan (12V)
+ * - ALL GROUNDS MUST BE COMMON
+ *
+ ************************************************************/
+
+
+/*
+ESP32 AIR QUALITY MONITOR + SMART FAN CONTROLLER
+ZPH02 + MQ135 + DHT22 + SD + WiFi NTP + Intel 4-Pin Fan
+FULL CSV LOGGING (AI READY)
+*/
+
+// ===================== LIBRARIES =====================
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <DHTesp.h>
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include <time.h>
+#include <Arduino.h>
+
+// ===================== WIFI & TIME =====================
+const char* ssid     = "JioAir";
+const char* password = "Gita@2025";
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;   // IST
+const int   daylightOffset_sec = 0;
+
+// ===================== PIN DEFINITIONS =====================
+#define SD_CS     5
+#define DHT_PIN   14
+#define MQ_AQ     32
+#define MQ_DQ     27
+#define ZPH_RX    17
+#define ZPH_TX    16
+
+#define FAN_PWM_PIN   25
+#define FAN_TACH_PIN  26
+
+// ===================== FAN PWM =====================
+#define PWM_FREQ 25000
+#define PWM_RES  8
+
+// ===================== OBJECTS =====================
+DHTesp dht;
+HardwareSerial zphSerial(2);
+File dataFile;
+
+// ===================== GLOBALS =====================
+unsigned long lastLog = 0;
+
+// PM2.5 averaging
+float pm25_sum = 0;
+uint16_t pm_count = 0;
+
+// Fan + RPM
+volatile uint32_t tachPulses = 0;
+unsigned long lastRPMTime = 0;
+int rpmSamples[5] = {0};
+uint8_t rpmIndex = 0;
+int rpmAverage = 0;
+
+int fanPercent = 0;
+int fanTarget  = 0;
+
+// ===================== TIME STRING =====================
+String getDateTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "1970-01-01 00:00:00";
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// ===================== AQI CALC =====================
+float calcEPA_PM25_AQI(float pm) {
+  if (pm <= 12.0) return (pm / 12.0) * 50;
+  if (pm <= 35.4) return 50 + ((pm - 12.0) / 23.4) * 50;
+  if (pm <= 55.4) return 100 + ((pm - 35.4) / 20.0) * 50;
+  if (pm <= 150.4) return 150 + ((pm - 55.4) / 95.0) * 50;
+  if (pm <= 250.4) return 200 + ((pm - 150.4) / 100.0) * 100;
+  if (pm <= 350.4) return 300 + ((pm - 250.4) / 100.0) * 100;
+  if (pm <= 500.4) return 400 + ((pm - 350.4) / 150.0) * 100;
+  return 500;
+}
+
+String getAQICategory(float aqi) {
+  if (aqi <= 50) return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Unhealthy(Sensitive)";
+  if (aqi <= 200) return "Unhealthy";
+  if (aqi <= 300) return "Very Unhealthy";
+  return "Hazardous";
+}
+
+// ===================== FAN ISR =====================
+void IRAM_ATTR tachISR() {
+  tachPulses++;
+}
+
+// ===================== FAN CONTROL =====================
+void setFanPercent(int percent) {
+  percent = constrain(percent, 0, 100);
+  fanPercent = percent;
+
+  // Intel PWM = active LOW
+  int duty = map(100 - percent, 0, 100, 0, 255);
+  ledcWrite(FAN_PWM_PIN, duty);
+}
+
+// ===================== FAN DECISION LOGIC =====================
+int fanFromPM(float pm) {
+  if (pm < 25) return 0;
+  if (pm < 50) return 40;
+  if (pm < 100) return 70;
+  return 100;
+}
+
+int fanFromAQI(float aqi) {
+  if (aqi < 50) return 0;
+  if (aqi < 100) return 40;
+  if (aqi < 150) return 70;
+  return 100;
+}
+
+int fanFromTemp(float t) {
+  if (t < 30) return 0;
+  if (t < 35) return 40;
+  if (t < 40) return 70;
+  return 100;
+}
+
+// ===================== ZPH02 PM2.5 =====================
+float parseZPH02_PM25() {
+  while (zphSerial.available() >= 9) {
+    if (zphSerial.read() != 0xFF) continue;
+
+    uint8_t buf[9];
+    buf[0] = 0xFF;
+    zphSerial.readBytes(&buf[1], 8);
+
+    uint8_t sum = 0;
+    for (int i = 1; i <= 7; i++) sum += buf[i];
+    sum = (~sum) + 1;
+
+    if (buf[8] == sum) {
+      uint16_t raw = (buf[3] << 8) | buf[4];
+      return raw / 100.0f;
+    }
+  }
+  return -1;
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  SPI.begin(18, 19, 23, SD_CS);
+  SD.begin(SD_CS);
+
+  if (!SD.exists("/aqi_data.csv")) {
+    dataFile = SD.open("/aqi_data.csv", FILE_WRITE);
+    dataFile.println(
+      "DateTime,Temp_C,Humidity_%,MQ_Analog,MQ_Digital,eCO2_ppm,PM25_ugm3,AQI,AQI_Category,FanPercent,RPM"
+    );
+    dataFile.close();
+  }
+
+  dht.setup(DHT_PIN, DHTesp::DHT22);
+  pinMode(MQ_DQ, INPUT);
+  zphSerial.begin(9600, SERIAL_8N1, ZPH_RX, ZPH_TX);
+
+  ledcAttach(FAN_PWM_PIN, PWM_FREQ, PWM_RES);
+  setFanPercent(0);
+
+  pinMode(FAN_TACH_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), tachISR, FALLING);
+}
+
+// ===================== LOOP =====================
+void loop() {
+
+  // ---- Continuous PM sampling ----
+  float pm = parseZPH02_PM25();
+  if (pm > 0) {
+    pm25_sum += pm;
+    pm_count++;
+  }
+
+  // ---- RPM every second ----
+  if (millis() - lastRPMTime >= 1000) {
+    lastRPMTime = millis();
+
+    noInterrupts();
+    uint32_t pulses = tachPulses;
+    tachPulses = 0;
+    interrupts();
+
+    int rpm = (pulses * 60) / 2;
+    rpmSamples[rpmIndex++] = rpm;
+    if (rpmIndex >= 5) rpmIndex = 0;
+
+    int sum = 0;
+    for (int i = 0; i < 5; i++) sum += rpmSamples[i];
+    rpmAverage = sum / 5;
+  }
+
+  // ---- LOG EVERY 30s ----
+  if (millis() - lastLog >= 30000) {
+    lastLog = millis();
+
+    TempAndHumidity dh = dht.getTempAndHumidity();
+    float temp = dh.temperature;
+    float hum  = dh.humidity;
+
+    int mqAnalog  = analogRead(MQ_AQ);
+    int mqDigital = digitalRead(MQ_DQ);
+
+    float eCO2 = ((mqAnalog / 4095.0) * 1000.0) + 400;
+
+    float avg_pm25 = (pm_count > 0) ? pm25_sum / pm_count : 0;
+    pm25_sum = 0;
+    pm_count = 0;
+
+    float aqi = calcEPA_PM25_AQI(avg_pm25);
+    String category = getAQICategory(aqi);
+
+    fanTarget = max(fanFromPM(avg_pm25),
+                max(fanFromAQI(aqi), fanFromTemp(temp)));
+
+    if (fanTarget > fanPercent + 10 || fanTarget < fanPercent - 10) {
+      setFanPercent(fanTarget);
+    }
+
+    String timeStr = getDateTimeString();
+
+    Serial.println();
+    Serial.println("========== AIR QUALITY LOG ==========");
+    Serial.println("Timestamp        : " + timeStr);
+
+    Serial.printf("Temperature (°C) : %.1f\n", temp);
+    Serial.printf("Humidity (%%)     : %.1f\n", hum);
+
+    Serial.println("--- GAS SENSOR (MQ135) ---");
+    Serial.printf("MQ Analog Value  : %d\n", mqAnalog);
+    Serial.printf("MQ Digital State : %d\n", mqDigital);
+    Serial.printf("Estimated eCO2   : %.0f ppm\n", eCO2);
+
+    Serial.println("--- PARTICULATE MATTER ---");
+    Serial.printf("PM2.5 (avg)      : %.1f µg/m³\n", avg_pm25);
+    Serial.printf("AQI (EPA)        : %.0f\n", aqi);
+    Serial.println("AQI Category     : " + category);
+
+    Serial.println("--- FAN STATUS ---");
+    Serial.printf("Fan Target       : %d %%\n", fanTarget);
+    Serial.printf("Fan Output       : %d %%\n", fanPercent);
+    Serial.printf("Fan RPM          : %d\n", rpmAverage);
+
+    Serial.println("====================================");
+
+
+    dataFile = SD.open("/aqi_data.csv", FILE_APPEND);
+    if (dataFile) {
+      dataFile.printf(
+        "%s,%.1f,%.1f,%d,%d,%.0f,%.1f,%.0f,\"%s\",%d,%d\n",
+        timeStr.c_str(),
+        temp, hum,
+        mqAnalog, mqDigital,
+        eCO2,
+        avg_pm25,
+        aqi,
+        category.c_str(),
+        fanPercent,
+        rpmAverage
+      );
+      dataFile.close();
+    }
+  }
+}
